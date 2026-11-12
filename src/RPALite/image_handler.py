@@ -1,28 +1,305 @@
 import cv2
 import numpy as np
-from typing import List, Tuple, Optional
+from typing import List, Tuple, Optional, Union
 import logging
 import math
 from difflib import SequenceMatcher
 
 logger = logging.getLogger(__name__)
 
+# Default parameters for multi-scale template matching. They can be overridden
+# per ImageHandler instance (constructor) or per find_image_matches() call.
+DEFAULT_MATCH_THRESHOLD = 0.9
+DEFAULT_MATCH_SCALES = (0.5, 0.75, 1.0, 1.25, 1.5, 2.0)
+DEFAULT_NMS_THRESHOLD = 0.3
+
+# A result entry of find_image_matches:
+#   (top_left_x, top_left_y, width, height, match_score)
+ImageMatch = Tuple[int, int, int, int, float]
+
+
 class ImageHandler:
-    def __init__(self, debug_mode: bool = False, ocr_engine: str = "paddleocr", languages: List[str] = ['en'], debug_image_show_seconds=5):
+    def __init__(self, debug_mode: bool = False, ocr_engine: str = "paddleocr", languages: List[str] = ['en'], debug_image_show_seconds=5,
+                 match_threshold: float = DEFAULT_MATCH_THRESHOLD,
+                 match_scales: Optional[Tuple[Union[float, Tuple[float, float]], ...]] = None,
+                 nms_threshold: float = DEFAULT_NMS_THRESHOLD):
         '''
-        Initialize the ImageHandler class. This class use EasyOCR for text OCR. About language codes please check https://www.jaided.ai/easyocr/'''
+        Initialize the ImageHandler class. This class use EasyOCR for text OCR. About language codes please check https://www.jaided.ai/easyocr/
+
+        Parameters
+        ----------
+        match_threshold: float
+            Correlation threshold (TM_CCOEFF_NORMED) in the range [0, 1]. Template
+            matches below this score are discarded.
+        match_scales: tuple
+            Configurable search scales. Each entry is either a float for isotropic
+            scaling or an (x_scale, y_scale) tuple for independent dual-axis scaling.
+            A scale of 1.0 means the template is searched at its original size.
+        nms_threshold: float
+            Intersection-over-union threshold used by non-maximum suppression.
+            Overlapping candidates whose IoU is greater than this value are merged
+            into the single highest-scoring candidate.
+        '''
         self.debug_mode = debug_mode
         self.languages = languages
         self.debug_image_show_milliseconds = debug_image_show_seconds * 1000
+        # OCR handler is initialized lazily (see _get_ocr_handler) so that image
+        # matching works in environments where the OCR backend is not installed.
+        self.ocr_engine = ocr_engine
+        self._ocr_handler = None
+        self.match_threshold = self._validate_threshold(match_threshold, DEFAULT_MATCH_THRESHOLD)
+        self.match_scales = self._normalize_scales(match_scales if match_scales is not None else DEFAULT_MATCH_SCALES)
+        self.nms_threshold = self._validate_threshold(nms_threshold, DEFAULT_NMS_THRESHOLD)
+
+    @property
+    def ocr_handler(self):
+        '''Lazily initialize and return the OCR handler. Keeps the historical
+        ``handler.ocr_handler`` attribute while avoiding loading heavy OCR
+        dependencies until an OCR method is actually called.'''
+        return self._get_ocr_handler()
+
+    @staticmethod
+    def _validate_threshold(value, default: float) -> float:
+        try:
+            value = float(value)
+        except (TypeError, ValueError):
+            return default
+        if not math.isfinite(value) or value < 0.0 or value > 1.0:
+            return default
+        return value
+
+    @staticmethod
+    def _normalize_scales(scales) -> Tuple[Tuple[float, float], ...]:
+        '''Normalize the configurable scales into a tuple of (scale_x, scale_y)
+        pairs. Invalid entries are skipped; an empty/invalid input falls back to
+        the single identity scale (1.0, 1.0).'''
+        normalized = []
+        if scales is None:
+            scales = DEFAULT_MATCH_SCALES
+        if not isinstance(scales, (list, tuple)):
+            scales = (scales,)
+        for scale in scales:
+            try:
+                if isinstance(scale, (list, tuple)):
+                    if len(scale) < 2:
+                        continue
+                    sx, sy = float(scale[0]), float(scale[1])
+                else:
+                    sx = sy = float(scale)
+            except (TypeError, ValueError):
+                continue
+            if math.isfinite(sx) and math.isfinite(sy) and sx > 0 and sy > 0:
+                pair = (sx, sy)
+                if pair not in normalized:
+                    normalized.append(pair)
+        if not normalized:
+            normalized = [(1.0, 1.0)]
+        return tuple(normalized)
+
+    def _get_ocr_handler(self):
+        if self._ocr_handler is not None:
+            return self._ocr_handler
         # Initialize OCR handler based on selected engine
-        if ocr_engine.lower() == "paddleocr":
+        if self.ocr_engine.lower() == "paddleocr":
             from .paddleocr_handler import PaddleOCRHandler
-            self.ocr_handler = PaddleOCRHandler(languages, debug_mode)
+            self._ocr_handler = PaddleOCRHandler(self.languages, self.debug_mode)
         else:
             from .easyocr_handler import EasyOCRHandler
-            self.ocr_handler = EasyOCRHandler(languages, debug_mode)
-        pass
-    
+            self._ocr_handler = EasyOCRHandler(self.languages, self.debug_mode)
+        return self._ocr_handler
+
+    @staticmethod
+    def _to_gray(image) -> Optional[np.ndarray]:
+        '''Convert a PIL image or numpy array to a single-channel uint8 image.
+        Returns None for empty or otherwise invalid inputs instead of raising.'''
+        if image is None:
+            return None
+        try:
+            if isinstance(image, np.ndarray):
+                array = image
+            else:
+                # PIL image (or anything exposing the PIL array protocol)
+                array = np.array(image)
+        except Exception as e:
+            logger.error(f"Error converting image to array: {e}")
+            return None
+        if array is None or array.size == 0:
+            return None
+        if array.dtype != np.uint8:
+            array = array.astype(np.uint8)
+        if array.ndim == 2:
+            return array
+        if array.ndim == 3:
+            if array.shape[2] == 4:
+                return cv2.cvtColor(array, cv2.COLOR_BGRA2GRAY)
+            if array.shape[2] == 3:
+                return cv2.cvtColor(array, cv2.COLOR_BGR2GRAY)
+            if array.shape[2] == 1:
+                return array[:, :, 0]
+        return None
+
+    @staticmethod
+    def _iou(box_a, box_b) -> float:
+        '''Intersection over union of two (x, y, width, height) boxes.'''
+        ax1, ay1, aw, ah = box_a[:4]
+        bx1, by1, bw, bh = box_b[:4]
+        ax2, ay2 = ax1 + aw, ay1 + ah
+        bx2, by2 = bx1 + bw, by1 + bh
+        inter_w = max(0, min(ax2, bx2) - max(ax1, bx1))
+        inter_h = max(0, min(ay2, by2) - max(ay1, by1))
+        inter_area = inter_w * inter_h
+        union_area = aw * ah + bw * bh - inter_area
+        if union_area <= 0:
+            return 0.0
+        return inter_area / union_area
+
+    def _non_max_suppression(self, candidates: List[ImageMatch], nms_threshold: float) -> List[ImageMatch]:
+        '''Greedily suppress overlapping candidates. Candidates are
+        (x, y, width, height, score); the highest-scoring candidate of each
+        overlapping group survives, so every visible control yields a single
+        unique hit rather than a cluster of overlapping coordinates.'''
+        if not candidates:
+            return []
+        # Highest score first, then top-left position for deterministic ordering.
+        ordered = sorted(candidates, key=lambda c: (-float(c[4]), c[1], c[0]))
+        kept: List[ImageMatch] = []
+        for candidate in ordered:
+            if all(self._iou(candidate, existing) <= nms_threshold for existing in kept):
+                kept.append(candidate)
+        # Keep the score-descending order for callers.
+        return kept
+
+    def find_image_matches(self, image, parentImage,
+                           threshold: Optional[float] = None,
+                           scales=None,
+                           nms_threshold: Optional[float] = None) -> List[ImageMatch]:
+        '''
+        Multi-scale, thresholded and non-maximum-suppressed template matching.
+
+        For every visible occurrence of ``image`` inside ``parentImage`` it returns
+        exactly one entry: ``(top_left_x, top_left_y, width, height, match_score)``.
+        Coordinates are expressed in the parent image's pixel space (physical
+        screenshot pixels); callers convert them back to logical screen
+        coordinates themselves.
+
+        Parameters
+        ----------
+        image: PIL.Image or numpy.ndarray
+            The template to search for.
+        parentImage: PIL.Image or numpy.ndarray
+            The image to search in.
+        threshold: float, optional
+            Correlation threshold in [0, 1]. Overrides the instance default.
+        scales: tuple/list, optional
+            Scales to search at. Each entry is a float or an (x_scale, y_scale)
+            pair. Overrides the instance default.
+        nms_threshold: float, optional
+            IoU threshold for non-maximum suppression. Overrides the instance
+            default.
+
+        Returns
+        -------
+        list
+            Unique matches sorted by descending score, each a 5-tuple
+            ``(x, y, width, height, score)``. Returns an empty list for empty
+            images, templates larger than the parent image, or any other edge
+            case; it never raises.
+        '''
+        try:
+            threshold = self.match_threshold if threshold is None else self._validate_threshold(threshold, self.match_threshold)
+            nms_threshold = self.nms_threshold if nms_threshold is None else self._validate_threshold(nms_threshold, self.nms_threshold)
+            search_scales = self.match_scales if scales is None else self._normalize_scales(scales)
+
+            gray_parent = self._to_gray(parentImage)
+            gray_template = self._to_gray(image)
+            if gray_parent is None or gray_template is None:
+                return []
+
+            parent_h, parent_w = gray_parent.shape[:2]
+            base_h, base_w = gray_template.shape[:2]
+            if parent_h <= 0 or parent_w <= 0 or base_h <= 0 or base_w <= 0:
+                return []
+
+            # TM_CCOEFF_NORMED is undefined for zero-variance (constant)
+            # templates; some OpenCV builds return NaN, others a misleading
+            # perfect 1.0 everywhere. Treat such templates as unmatchable.
+            if float(gray_template.std()) == 0.0:
+                logger.warning("Template image has no variance (constant color); skipping template matching")
+                return []
+
+            if self.debug_mode:
+                try:
+                    cv2.imshow('shapes', gray_parent)
+                    cv2.waitKey(self.debug_image_show_milliseconds)
+                    cv2.destroyAllWindows()
+                except Exception:
+                    pass
+
+            candidates: List[ImageMatch] = []
+            for scale_x, scale_y in search_scales:
+                scaled_w = max(1, int(round(base_w * scale_x)))
+                scaled_h = max(1, int(round(base_h * scale_y)))
+                # A template that is not strictly smaller than the parent image
+                # cannot be matched; skip this scale rather than raising.
+                if scaled_w > parent_w or scaled_h > parent_h:
+                    continue
+
+                if scaled_w == base_w and scaled_h == base_h:
+                    resized_template = gray_template
+                else:
+                    resized_template = cv2.resize(gray_template, (scaled_w, scaled_h),
+                                                  interpolation=cv2.INTER_AREA)
+                if resized_template is None or resized_template.size == 0:
+                    continue
+
+                result = cv2.matchTemplate(gray_parent, resized_template, cv2.TM_CCOEFF_NORMED)
+                if result is None or result.size == 0:
+                    continue
+                # TM_CCOEFF_NORMED can produce NaN on degenerate (constant)
+                # regions; replace NaNs so threshold comparisons stay safe.
+                result = np.nan_to_num(result, nan=-1.0, posinf=1.0, neginf=-1.0)
+
+                ys, xs = np.where(result >= threshold)
+                scale_candidates = [
+                    (int(x), int(y), scaled_w, scaled_h, float(result[y, x]))
+                    for x, y in zip(xs, ys)
+                ]
+                # Suppress overlapping raw peaks produced at the same scale first.
+                candidates.extend(self._non_max_suppression(scale_candidates, nms_threshold))
+
+            # A single real control may be detected at several adjacent scales;
+            # suppress cross-scale duplicates so each visible control is unique.
+            matches = self._non_max_suppression(candidates, nms_threshold)
+            return matches
+        except Exception as e:
+            logger.error(f"Error in find_image_matches: {e}")
+            return []
+        finally:
+            if self.debug_mode:
+                try:
+                    cv2.destroyAllWindows()
+                except Exception:
+                    pass
+
+    def find_image_match_centers(self, image, parentImage,
+                                 threshold: Optional[float] = None,
+                                 scales=None,
+                                 nms_threshold: Optional[float] = None) -> List[Tuple[int, int, float]]:
+        '''
+        Return the unique center point and hit score of every visible control.
+
+        Returns
+        -------
+        list
+            ``(center_x, center_y, match_score)`` tuples sorted by descending
+            score. Returns an empty list when nothing matches or on any edge
+            case; it never raises.
+        '''
+        centers = []
+        for x, y, w, h, score in self.find_image_matches(image, parentImage, threshold, scales, nms_threshold):
+            centers.append((x + int(round(w / 2.0)), y + int(round(h / 2.0)), score))
+        return centers
+
     def check_point_inide_rect(self, point, rect):  # Should probably be "inside_rect"
         '''Check if a point is in a rect. The point's coordinates are (x, y). The rect's coordinates are (x, y, width, height).'''
         if point is None or rect is None:
@@ -42,68 +319,43 @@ class ImageHandler:
         
     
     def find_image_location(self, image, parentImage):
+        '''
+        Find the single best location of ``image`` inside ``parentImage`` using
+        configurable multi-scale template matching with a correlation threshold
+        and non-maximum suppression.
+
+        Returns
+        -------
+        tuple
+            ``(top_left_x, top_left_y, width, height)`` of the highest-scoring
+            match, or None when there is no match / the input is invalid.
+        '''
         if parentImage is None or image is None:
             return None
-        # Find the location of the image in the parent image
-        try:
-            if self.debug_mode:
-                cv2.imshow('shapes', np.array(parentImage)) 
-                cv2.waitKey(self.debug_image_show_milliseconds)
-                cv2.destroyAllWindows()
-
-            gray = cv2.cvtColor(np.array(parentImage), cv2.COLOR_BGR2GRAY)
-            
-            target = cv2.cvtColor(np.array(image), cv2.COLOR_BGR2GRAY)
-            
-            # Use template matching to find the location of the image in the parent image
-            result = cv2.matchTemplate(gray, target, cv2.TM_CCOEFF_NORMED)
-            min_val, max_val, min_loc, max_loc = cv2.minMaxLoc(result)
-            top_left = max_loc
-                
-            # Get the size of the image
-            image_size = image.size
-            
-            # Return the rectangle representing the location of the image in the parent image
-            return (top_left[0], top_left[1], image_size[0], image_size[1])
-        except Exception as e:
-            logger.error(f"Error in find_image_location: {e}")
+        matches = self.find_image_matches(image, parentImage)
+        if not matches:
             return None
-        finally:
-            if self.debug_mode:
-                cv2.destroyAllWindows()
+        x, y, w, h, score = matches[0]
+        return (x, y, w, h)
 
     def find_all_image_locations(self, image, parentImage):
+        '''
+        Find every distinct visible occurrence of ``image`` inside
+        ``parentImage``. Multi-scale matching is thresholded and non-maximum
+        suppressed, so one real control produces exactly one rectangle instead
+        of a cluster of overlapping coordinates.
+
+        Returns
+        -------
+        list
+            A list of ``(top_left_x, top_left_y, width, height)`` tuples sorted
+            by descending match score. Returns an empty list (never None) when
+            nothing matches or on any edge case.
+        '''
         if parentImage is None or image is None:
-            return None
-        # Find the location of the image in the parent image
-        try:
-            if self.debug_mode:
-                cv2.imshow('shapes', np.array(parentImage)) 
-                cv2.waitKey(self.debug_image_show_milliseconds)
-                cv2.destroyAllWindows()
+            return []
+        return [(x, y, w, h) for x, y, w, h, score in self.find_image_matches(image, parentImage)]
 
-            gray = cv2.cvtColor(np.array(parentImage), cv2.COLOR_BGR2GRAY)
-            
-            target = cv2.cvtColor(np.array(image), cv2.COLOR_BGR2GRAY)
-            
-            # Use template matching to find the location of the image in the parent image
-            result = cv2.matchTemplate(gray, target, cv2.TM_CCOEFF_NORMED)
-            
-            # find all the image locations in the parent image
-            locations = np.where(result >= 0.9)
-            h, w = target.shape
-
-            # Sort and convert the locations to a list of tuples including height and width
-            sorted_locations = sorted([(pt[0], pt[1], w, h) for pt in zip(*locations[::-1])], key=lambda y: y[1])
-
-            return sorted_locations
-        except Exception as e:
-            logger.error(f"Error in find_all_image_locations: {e}")
-            return None
-        finally:
-            if self.debug_mode:
-                cv2.destroyAllWindows()
-        
     def find_text_in_array(self, text, arrays, windows):
         '''
         Returns the location information, format is (top_x, top_y, width, height) of the text. This function will first iterate over the arrays, find matched text and check it is in the window. If the matched text is in the window, the function will return the text location. If no matched text found returns None.
@@ -149,7 +401,7 @@ class ImageHandler:
             enhanced_borders = cv2.GaussianBlur(enhanced_borders, (3, 3), 0)
             img_array = cv2.addWeighted(cv_image, 0.9, enhanced_borders, 0.1, 0)
 
-            arr = self.ocr_handler.find_texts_in_image(image)
+            arr = self._get_ocr_handler().find_texts_in_image(image)
             return arr
         except Exception as e:
             logger.error(f"Error in read_text: {e}")

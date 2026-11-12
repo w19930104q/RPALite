@@ -54,20 +54,33 @@ class RPALite:
     '''
 
     def __init__(self, debug_mode: bool = False, ocr_engine: str = "easyocr", languages: List[str] = ['en'],
-                 step_pause_interval: int = 3):
+                 step_pause_interval: int = 3,
+                 image_match_threshold: float = 0.9,
+                 image_match_scales=None,
+                 image_nms_threshold: float = 0.3):
         """
         Initialize the RPALite class.
         :param debug_mode: Whether to enable debug mode
         :param ocr_engine: OCR engine to use (easyocr or paddleocr)
         :param languages: Languages for OCR
         :param step_pause_interval: Time to wait between steps
+        :param image_match_threshold: Correlation threshold in [0, 1] for image
+            template matching; candidates below this score are discarded.
+        :param image_match_scales: Configurable scales to search templates at.
+            Each entry is a float (isotropic) or an (x_scale, y_scale) tuple
+            (independent dual-axis scaling); 1.0 is the template's own size.
+        :param image_nms_threshold: IoU threshold for non-maximum suppression of
+            overlapping image match candidates.
         """
         self.platform = platform.system()
         self.debug_mode = debug_mode
         self.ocr_engine = ocr_engine
         if self.platform not in ['Windows', 'Linux', 'Darwin']:
             raise Exception('This version currently only supports Windows, macOS and Linux. Other platforms will be supported in the future.')
-        self.image_handler = ImageHandler(debug_mode, ocr_engine, languages)
+        self.image_handler = ImageHandler(debug_mode, ocr_engine, languages,
+                                          match_threshold=image_match_threshold,
+                                          match_scales=image_match_scales,
+                                          nms_threshold=image_nms_threshold)
         self.step_pause_interval = step_pause_interval
         self.screen_recording_thread = None
         self.screen_recording_file = None
@@ -1111,7 +1124,7 @@ class RPALite:
         Returns
         -------
         list
-            A list of locations of the image in the screen. Each location is a tuple of (x, y, width, height). 
+            A list of locations of the image in the screen. Each location is a tuple of (x, y, width, height).
             If no matches are found, an empty list will be returned.
         '''
         if isinstance(image, str):
@@ -1123,6 +1136,104 @@ class RPALite:
             parent_image = PIL.Image.open(parent_image)
 
         return self.image_handler.find_all_image_locations(image, parent_image)
+
+    def find_image_matches(self, image, parent_image=None, threshold=None, scales=None, nms_threshold=None,
+                           return_logical_coordinates=False):
+        '''Find every distinct visible occurrence of an image using configurable
+        multi-scale template matching with a correlation threshold and
+        non-maximum suppression. Each visible control is returned exactly once
+        together with its hit score, so automated clicks no longer land on
+        duplicate overlapping coordinates.
+
+        Parameters
+        ----------
+        image: str or PIL image
+            The image to search for. This can be the path of image or PIL image.
+
+        parent_image: str or PIL image
+            The image to search from. This can be the path of image or PIL image.
+            If None, a screenshot of the current screen is taken.
+
+        threshold: float, optional
+            Correlation threshold in [0, 1] overriding the library default for
+            this call only.
+
+        scales: tuple/list, optional
+            Scales to search at. Each entry is a float (isotropic) or an
+            (x_scale, y_scale) tuple for independent dual-axis scaling, e.g.
+            (1.5, 2.0) models a screen scaled 150% horizontally and 200%
+            vertically. Overrides the library default for this call only.
+
+        nms_threshold: float, optional
+            IoU threshold for non-maximum suppression, overriding the library
+            default for this call only.
+
+        return_logical_coordinates: bool
+            When True the returned rectangles are converted from physical
+            screenshot pixels back to logical screen coordinates using the
+            platform-independent display scaling factors. When False (default)
+            the raw physical coordinates are returned.
+
+        Returns
+        -------
+        list
+            A list of ``(x, y, width, height, score)`` tuples sorted by
+            descending score. An empty list is returned (no exceptions raised)
+            when nothing matches or on edge cases such as empty images or
+            templates larger than the search area.
+        '''
+        if isinstance(image, str):
+            image = PIL.Image.open(image)
+
+        if parent_image is None:
+            parent_image = self.take_screenshot()
+        elif isinstance(parent_image, str):
+            parent_image = PIL.Image.open(parent_image)
+
+        matches = self.image_handler.find_image_matches(image, parent_image, threshold, scales, nms_threshold)
+        if return_logical_coordinates:
+            logical_matches = []
+            for x, y, w, h, score in matches:
+                logical_matches.append(tuple(self._scale_region_to_logical(x, y, w, h)) + (score,))
+            return logical_matches
+        return matches
+
+    def find_image_match_centers(self, image, parent_image=None, threshold=None, scales=None, nms_threshold=None,
+                                 return_logical_coordinates=True):
+        '''Return the unique center point and hit score of every visible control
+        matching the image. This is the safe input for automated clicking: each
+        real control yields exactly one center instead of a group of overlapping
+        coordinates.
+
+        Parameters
+        ----------
+        image, parent_image, threshold, scales, nms_threshold
+            See :func:`find_image_matches`.
+
+        return_logical_coordinates: bool
+            Defaults to True: centers are converted back to logical screen
+            coordinates (the coordinate system used by the click/mouse APIs).
+            Set to False to keep the physical screenshot coordinates.
+
+        Returns
+        -------
+        list
+            A list of ``(center_x, center_y, score)`` tuples sorted by
+            descending score. An empty list is returned when nothing matches or
+            on any edge case; the method never raises.
+        '''
+        if isinstance(image, str):
+            image = PIL.Image.open(image)
+
+        if parent_image is None:
+            parent_image = self.take_screenshot()
+        elif isinstance(parent_image, str):
+            parent_image = PIL.Image.open(parent_image)
+
+        centers = self.image_handler.find_image_match_centers(image, parent_image, threshold, scales, nms_threshold)
+        if return_logical_coordinates:
+            return [self._scale_coordinates_to_logical(x, y) + (score,) for x, y, score in centers]
+        return centers
 
     def wait_until_image_shown(self, image, parent_image = None, timeout = 30):
         '''Wait until an image appears on screen or in a parent image.
